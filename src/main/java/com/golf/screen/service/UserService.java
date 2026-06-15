@@ -39,6 +39,7 @@ public class UserService {
     private final PortOneService portOneService;
     private final FileService fileService;
     private final PasswordEncoder passwordEncoder;
+    private final SmsService smsService;
 
     private String hashPhoneNumber(String phoneNumber) {
         if (phoneNumber == null || phoneNumber.trim().isEmpty()) {
@@ -69,8 +70,20 @@ public class UserService {
             throw new CustomException(ErrorCode.PASSWORD_CONFIRM_NOT_MATCH);
         }
 
+        // 비밀번호 강도 및 패턴 검증 추가
+        validatePassword(request.getPassword());
+
         // 2. 포트원 실명/번호/성별 인증 대조
         PortOneService.CertificationInfo certInfo = portOneService.verifyCertification(request.getIdentityVerificationId());
+
+        // 휴대폰 번호 중복 가입 체크 (다른 이메일 사용자가 동일 연락처로 가입하는 것 차단)
+        String certPhone = certInfo.getPhone();
+        List<User> usersByPhone = userRepository.findByPhoneNumber(certPhone);
+        boolean isDuplicate = usersByPhone.stream()
+                .anyMatch(u -> !u.getEmail().equals(request.getEmail()));
+        if (isDuplicate) {
+            throw new CustomException(ErrorCode.PHONE_ALREADY_EXISTS);
+        }
 
         // 3. 비밀번호 암호화
         String encodedPassword = passwordEncoder.encode(request.getPassword());
@@ -96,6 +109,7 @@ public class UserService {
             }
             
             // 소셜 가입만 되어 있는 상태라면, 일반 로그인 정보(비밀번호, 실제 전화번호, 성별)를 덧입혀 계정 통합 진행
+            existingUser.setName(certInfo.getName());
             existingUser.setPassword(encodedPassword);
             existingUser.setNickname(request.getNickname());
             existingUser.setGender(certInfo.getGender());
@@ -108,6 +122,7 @@ public class UserService {
             // 최초 신규 가입
             user = User.builder()
                     .email(request.getEmail())
+                    .name(certInfo.getName())
                     .password(encodedPassword)
                     .nickname(request.getNickname())
                     .gender(certInfo.getGender())
@@ -160,6 +175,7 @@ public class UserService {
 
         // 2. 비밀번호 수정 (입력했을 시에만)
         if (request.getPassword() != null && !request.getPassword().isEmpty()) {
+            validatePassword(request.getPassword());
             user.setPassword(passwordEncoder.encode(request.getPassword()));
         }
 
@@ -305,5 +321,209 @@ public class UserService {
                 .mannerTemperature(user.getMannerTemperature())
                 .bio(user.getBio())
                 .build();
+    }
+
+    /**
+     * 임시 비밀번호 재설정 및 SMS 발송
+     */
+    @Transactional
+    public void findAndResetPassword(com.golf.screen.dto.FindPasswordRequest request) {
+        // 1. 이메일로 사용자 조회
+        User user = userRepository.findByEmail(request.getEmail())
+                .orElseThrow(() -> new CustomException(ErrorCode.USER_NOT_FOUND));
+
+        // 2. 소셜 가입 사용자는 비밀번호 변경 불가 예외
+        if (user.getProvider() != AuthProvider.LOCAL) {
+            throw new CustomException(ErrorCode.SOCIAL_USER_CANNOT_RESET);
+        }
+
+        // 3. 연락처 비교 (하이픈 제거하고 비교)
+        String inputPhone = request.getPhoneNumber() != null ? request.getPhoneNumber().replace("-", "").trim() : "";
+        String dbPhone = user.getPhoneNumber() != null ? user.getPhoneNumber().replace("-", "").trim() : "";
+        if (!inputPhone.equals(dbPhone) || inputPhone.isEmpty()) {
+            throw new CustomException(ErrorCode.USER_INFO_NOT_MATCH);
+        }
+
+        // 4. 8자리 임시 비밀번호 생성 (대소문자 및 숫자가 난수로 혼합)
+        String tempPassword = generateTempPassword();
+
+        // 5. 임시 비밀번호 암호화 후 업데이트
+        user.setPassword(passwordEncoder.encode(tempPassword));
+        userRepository.save(user);
+
+        // 6. SMS 발송
+        smsService.sendSms(request.getPhoneNumber(), "[골프 스크린 조인] 임시 비밀번호는 [" + tempPassword + "] 입니다.");
+    }
+
+    private String generateTempPassword() {
+        String upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        String lower = "abcdefghijklmnopqrstuvwxyz";
+        String digits = "0123456789";
+        String specials = "!@#$%^&*()";
+        
+        java.security.SecureRandom random = new java.security.SecureRandom();
+        StringBuilder sb = new StringBuilder();
+        
+        // 각 문자 유형별로 최소 1개씩 선출 (보안 규격 보장)
+        sb.append(upper.charAt(random.nextInt(upper.length())));
+        sb.append(lower.charAt(random.nextInt(lower.length())));
+        sb.append(digits.charAt(random.nextInt(digits.length())));
+        sb.append(specials.charAt(random.nextInt(specials.length())));
+        
+        // 나머지 4자리는 전체 집합에서 무작위 선택
+        String all = upper + lower + digits + specials;
+        for (int i = 0; i < 4; i++) {
+            sb.append(all.charAt(random.nextInt(all.length())));
+        }
+        
+        // 순서 섞기 (Shuffle)
+        java.util.List<Character> list = new java.util.ArrayList<>();
+        for (char c : sb.toString().toCharArray()) {
+            list.add(c);
+        }
+        java.util.Collections.shuffle(list);
+        
+        StringBuilder result = new StringBuilder();
+        for (char c : list) {
+            result.append(c);
+        }
+        return result.toString();
+    }
+
+    private void validatePassword(String password) {
+        if (password == null || password.length() < 8) {
+            throw new CustomException(ErrorCode.INVALID_PASSWORD_FORMAT);
+        }
+
+        // 영문, 숫자, 특수문자 조합 체크
+        boolean hasLetter = false;
+        boolean hasDigit = false;
+        boolean hasSpecial = false;
+
+        for (char c : password.toCharArray()) {
+            if (Character.isLetter(c)) {
+                hasLetter = true;
+            } else if (Character.isDigit(c)) {
+                hasDigit = true;
+            } else if ("!@#$%^&*()_+-=[]{};':\"\\|,.<>/?".indexOf(c) >= 0) {
+                hasSpecial = true;
+            }
+        }
+
+        if (!hasLetter || !hasDigit || !hasSpecial) {
+            throw new CustomException(ErrorCode.INVALID_PASSWORD_FORMAT);
+        }
+
+        // 연속성/반복성 감점 요인 체크 (3자 이상 연속/반복 시 페널티 적용)
+        String lowerPwd = password.toLowerCase();
+        String[] keyboardPatterns = {"qwertyuiop", "asdfghjkl", "zxcvbnm", "1234567890"};
+
+        for (int i = 0; i < lowerPwd.length() - 2; i++) {
+            char char1 = lowerPwd.charAt(i);
+            char char2 = lowerPwd.charAt(i + 1);
+            char char3 = lowerPwd.charAt(i + 2);
+
+            // 1) 알파벳/숫자 순차 증가 (abc, 123) 또는 감소 (cba, 321)
+            if ((char2 == char1 + 1 && char3 == char2 + 1) || (char2 == char1 - 1 && char3 == char2 - 1)) {
+                throw new CustomException(ErrorCode.PASSWORD_CONTAINS_SEQUENCE);
+            }
+
+            // 2) 동일 문자 3회 연속 반복 (aaa, 111)
+            if (char1 == char2 && char2 == char3) {
+                throw new CustomException(ErrorCode.PASSWORD_CONTAINS_SEQUENCE);
+            }
+
+            // 3) 키보드 QWERTY 배열 3자 연속 체크 (qwe, asd, zxc 등)
+            String chunk = lowerPwd.substring(i, i + 3);
+            for (String pattern : keyboardPatterns) {
+                if (pattern.contains(chunk) || new StringBuilder(pattern).reverse().toString().contains(chunk)) {
+                    throw new CustomException(ErrorCode.PASSWORD_CONTAINS_SEQUENCE);
+                }
+            }
+        }
+    }
+
+    /**
+     * 이름과 연락처로 가입된 이메일 찾기 (아이디 찾기)
+     */
+    public com.golf.screen.dto.FindIdResponse findEmailByNameAndPhone(com.golf.screen.dto.FindIdRequest request) {
+        String inputName = request.getName() != null ? request.getName().trim() : "";
+        String inputPhone = request.getPhoneNumber() != null ? request.getPhoneNumber().replace("-", "").trim() : "";
+
+        if (inputName.isEmpty() || inputPhone.isEmpty()) {
+            throw new CustomException(ErrorCode.INVALID_INPUT_VALUE);
+        }
+
+        // 이름으로 매칭되는 유저 목록 조회
+        List<User> users = userRepository.findByName(inputName);
+        
+        // 휴대폰 번호 매칭 대조 (하이픈 제거하고 비교)
+        User matchedUser = users.stream()
+                .filter(u -> u.getPhoneNumber() != null && u.getPhoneNumber().replace("-", "").trim().equals(inputPhone))
+                .findFirst()
+                .orElseThrow(() -> new CustomException(ErrorCode.USER_INFO_NOT_MATCH));
+
+        // 마스킹 처리된 이메일 반환
+        String maskedEmail = maskEmail(matchedUser.getEmail());
+        return new com.golf.screen.dto.FindIdResponse(maskedEmail);
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) {
+            return "";
+        }
+        String[] parts = email.split("@");
+        String id = parts[0];
+        String domain = parts[1];
+
+        if (id.length() <= 3) {
+            return id + "@" + domain;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(id.substring(0, 3));
+        for (int i = 3; i < id.length(); i++) {
+            sb.append("*");
+        }
+        sb.append("@").append(domain);
+        return sb.toString();
+    }
+
+    /**
+     * 소셜 로그인 유저의 본인인증 데이터(실명, 실제 전화번호, 성별) 업데이트 및 중복 가입 체크
+     */
+    @Transactional
+    public UserResponse verifySocialUser(Long userId, String identityVerificationId) {
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new CustomException(ErrorCode.USER_NOT_FOUND));
+
+        // 1. 포트원 인증 조회
+        PortOneService.CertificationInfo certInfo = portOneService.verifyCertification(identityVerificationId);
+
+        // 2. 다른 사용자가 이 번호를 사용 중인지 중복 가입 체크
+        String certPhone = certInfo.getPhone();
+        List<User> usersByPhone = userRepository.findByPhoneNumber(certPhone);
+        boolean isDuplicate = usersByPhone.stream()
+                .anyMatch(u -> !u.getId().equals(userId));
+        if (isDuplicate) {
+            throw new CustomException(ErrorCode.PHONE_ALREADY_EXISTS);
+        }
+
+        // 3. 탈퇴 통계 삭제 및 매너 온도 반영
+        double initialMannerTemperature = 36.5;
+        String phoneHash = hashPhoneNumber(certPhone);
+        java.util.Optional<WithdrawnUserStats> withdrawnStats = withdrawnUserStatsRepository.findByPhoneNumberHash(phoneHash);
+        if (withdrawnStats.isPresent()) {
+            initialMannerTemperature = withdrawnStats.get().getMannerTemperature();
+            user.setMannerTemperature(initialMannerTemperature);
+            withdrawnUserStatsRepository.delete(withdrawnStats.get());
+        }
+
+        // 4. 본인인증 정보 업데이트
+        user.setName(certInfo.getName());
+        user.setPhoneNumber(certPhone);
+        user.setGender(certInfo.getGender());
+
+        return UserResponse.from(user);
     }
 }

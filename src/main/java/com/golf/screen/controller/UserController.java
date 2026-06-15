@@ -130,4 +130,33 @@ public class UserController {
         UserResponse response = userService.clearRemovedDongs(principal.getName());
         return ResponseEntity.ok(response);
     }
+
+    /**
+     * 임시 비밀번호 발급 및 SMS 문자 전송
+     */
+    @PostMapping("/find-password")
+    public ResponseEntity<Void> findPassword(@RequestBody com.golf.screen.dto.FindPasswordRequest request) {
+        userService.findAndResetPassword(request);
+        return ResponseEntity.ok().build();
+    }
+
+    /**
+     * 이름과 연락처로 가입 이메일 찾기 (아이디 찾기)
+     */
+    @PostMapping("/find-id")
+    public ResponseEntity<com.golf.screen.dto.FindIdResponse> findId(@RequestBody com.golf.screen.dto.FindIdRequest request) {
+        com.golf.screen.dto.FindIdResponse response = userService.findEmailByNameAndPhone(request);
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * 소셜 가입 사용자의 최초 본인인증 정보 연동 및 중복 검증
+     */
+    @PostMapping("/{id}/social-verify")
+    public ResponseEntity<UserResponse> verifySocialUser(
+            @PathVariable Long id,
+            @RequestParam String identityVerificationId) {
+        UserResponse response = userService.verifySocialUser(id, identityVerificationId);
+        return ResponseEntity.ok(response);
+    }
 }
