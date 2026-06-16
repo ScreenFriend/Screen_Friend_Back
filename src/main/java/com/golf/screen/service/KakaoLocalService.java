@@ -13,6 +13,9 @@ import org.springframework.web.util.UriComponentsBuilder;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @RequiredArgsConstructor
@@ -24,7 +27,73 @@ public class KakaoLocalService {
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    // 인메모리 캐시 정의
+    private static final long CACHE_TTL_MS = 10 * 60 * 1000; // 10분 (600,000 ms)
+    private final Map<GridKey, CacheEntry> placeCache = new ConcurrentHashMap<>();
+
+    private static class GridKey {
+        private final double latitude;
+        private final double longitude;
+
+        public GridKey(double latitude, double longitude) {
+            this.latitude = latitude;
+            this.longitude = longitude;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            GridKey gridKey = (GridKey) o;
+            return Double.compare(gridKey.latitude, latitude) == 0 &&
+                    Double.compare(gridKey.longitude, longitude) == 0;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(latitude, longitude);
+        }
+
+        @Override
+        public String toString() {
+            return "[" + latitude + ", " + longitude + "]";
+        }
+    }
+
+    private static class CacheEntry {
+        private final List<PlaceSearchResponse> data;
+        private final long timestamp;
+
+        public CacheEntry(List<PlaceSearchResponse> data) {
+            this.data = data;
+            this.timestamp = System.currentTimeMillis();
+        }
+
+        public boolean isExpired() {
+            return System.currentTimeMillis() - this.timestamp > CACHE_TTL_MS;
+        }
+
+        public List<PlaceSearchResponse> getData() {
+            return data;
+        }
+    }
+
+    private GridKey getGridKey(double latitude, double longitude) {
+        // 소수점 둘째 자리까지 반올림 (약 1.1km 격자 단위)
+        double latGrid = Math.round(latitude * 100.0) / 100.0;
+        double lonGrid = Math.round(longitude * 100.0) / 100.0;
+        return new GridKey(latGrid, lonGrid);
+    }
+
     public List<PlaceSearchResponse> searchScreenGolf(double latitude, double longitude) {
+        GridKey key = getGridKey(latitude, longitude);
+        CacheEntry entry = placeCache.get(key);
+
+        if (entry != null && !entry.isExpired()) {
+            System.out.println("[KakaoLocalService] 캐시 히트! 격자: " + key + ", 기존 데이터 재사용 (크기: " + entry.getData().size() + ")");
+            return entry.getData();
+        }
+
         List<PlaceSearchResponse> results = new ArrayList<>();
 
         if ("YOUR_KAKAO_REST_KEY".equals(kakaoApiKey) || kakaoApiKey == null || kakaoApiKey.trim().isEmpty()) {
@@ -50,6 +119,7 @@ public class KakaoLocalService {
 
             HttpEntity<Void> entity = new HttpEntity<>(headers);
 
+            System.out.println("[KakaoLocalService] 카카오 API 직접 호출 발생! 격자: " + key + ", 좌표: " + latitude + ", " + longitude);
             ResponseEntity<String> response = restTemplate.exchange(uri, HttpMethod.GET, entity, String.class);
 
             if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
@@ -78,6 +148,11 @@ public class KakaoLocalService {
                                 .build());
                     }
                 }
+            }
+
+            // 결과를 캐시에 저장 (캐시 미스 해결)
+            if (!results.isEmpty()) {
+                placeCache.put(key, new CacheEntry(results));
             }
         } catch (Exception e) {
             System.err.println("[KakaoLocalService] 카카오 API 호출 중 오류 발생: " + e.getMessage());
